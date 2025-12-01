@@ -1,0 +1,265 @@
+//+------------------------------------------------------------------+
+//|                                                TrendLinesV2.mq5  |
+//|                                       Converted from Pine Script |
+//|                                      Original by LonesomeTheBlue |
+//+------------------------------------------------------------------+
+#property copyright "Gemini User"
+#property link      "https://www.mql5.com"
+#property version   "1.01"
+#property indicator_chart_window
+#property indicator_plots 0
+
+//--- Inputs
+input group "Time Filter"
+input int      InpStartYear   = 2020;    // Start Year
+input int      InpStartMonth  = 1;       // Start Month
+input int      InpStartDay    = 1;       // Start Day
+
+input group "Pivot Settings"
+input int      InpPeriod      = 20;      // Pivot Period (Left/Right)
+input int      InpPivotsCheck = 3;       // Number of Pivot Points to check (2-6)
+input int      InpMaxLines    = 3;       // Max Lines to Draw per side
+
+input group "Visuals"
+input color    InpUpColor     = clrLime; // Uptrend Line Color
+input color    InpDnColor     = clrRed;  // Downtrend Line Color
+input int      InpLineWidth   = 2;       // Line Width
+
+//--- Globals
+struct PivotPoint
+  {
+   double            price;
+   int               barIndex; // Shift relative to rates_total
+   datetime          time;
+  };
+
+PivotPoint HighPivots[];
+PivotPoint LowPivots[];
+string     ObjPrefix = "TLV2_";
+
+//+------------------------------------------------------------------+
+//| Custom Indicator initialization function                         |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   ArrayResize(HighPivots, InpPivotsCheck);
+   ArrayResize(LowPivots, InpPivotsCheck);
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Custom Indicator deinitialization function                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   ObjectsDeleteAll(0, ObjPrefix);
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Find the most recent N Pivot Highs and Lows              |
+//+------------------------------------------------------------------+
+void FindPivots(const double &high[], const double &low[], const datetime &time[], int total)
+  {
+   int foundHighs = 0;
+   int foundLows  = 0;
+   
+   // FIX: Use ZeroMemory instead of ArrayInitialize for structs
+   ZeroMemory(HighPivots);
+   ZeroMemory(LowPivots);
+
+   // We iterate backwards from the latest completed bar
+   for(int i = total - 1 - InpPeriod; i >= InpPeriod; i--)
+     {
+      // Break if we found enough pivots
+      if(foundHighs >= InpPivotsCheck && foundLows >= InpPivotsCheck)
+         break;
+
+      // Check Pivot High
+      if(foundHighs < InpPivotsCheck)
+        {
+         bool isHigh = true;
+         for(int k = 1; k <= InpPeriod; k++)
+           {
+            if(high[i] < high[i - k] || high[i] <= high[i + k])
+              {
+               isHigh = false;
+               break;
+              }
+           }
+         if(isHigh)
+           {
+            HighPivots[foundHighs].price = high[i];
+            HighPivots[foundHighs].barIndex = i;
+            HighPivots[foundHighs].time = time[i];
+            foundHighs++;
+           }
+        }
+
+      // Check Pivot Low
+      if(foundLows < InpPivotsCheck)
+        {
+         bool isLow = true;
+         for(int k = 1; k <= InpPeriod; k++)
+           {
+            if(low[i] > low[i - k] || low[i] >= low[i + k])
+              {
+               isLow = false;
+               break;
+              }
+           }
+         if(isLow)
+           {
+            LowPivots[foundLows].price = low[i];
+            LowPivots[foundLows].barIndex = i;
+            LowPivots[foundLows].time = time[i];
+            foundLows++;
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Create Object                                            |
+//+------------------------------------------------------------------+
+void CreateTrendLine(string name, datetime t1, double p1, datetime t2, double p2, color clr)
+  {
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_TREND, 0, t1, p1, t2, p2);
+     }
+   else
+     {
+      ObjectSetInteger(0, name, OBJPROP_TIME, 0, t1);
+      ObjectSetDouble(0, name, OBJPROP_PRICE, 0, p1);
+      ObjectSetInteger(0, name, OBJPROP_TIME, 1, t2);
+      ObjectSetDouble(0, name, OBJPROP_PRICE, 1, p2);
+     }
+
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, InpLineWidth);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, true);
+  }
+
+//+------------------------------------------------------------------+
+//| Core Logic: Check validity and Draw                              |
+//+------------------------------------------------------------------+
+void DrawTrendLines(const double &close[], const datetime &time[], int total)
+  {
+   ObjectsDeleteAll(0, ObjPrefix);
+
+   int countLineLo = 0;
+   int countLineHi = 0;
+
+   // --- PROCESS UPTREND LINES ---
+   for(int p1 = 0; p1 < InpPivotsCheck - 1; p1++)
+     {
+      if(countLineLo >= InpMaxLines) break;
+
+      for(int p2 = p1 + 1; p2 < InpPivotsCheck; p2++)
+        {
+         if(LowPivots[p1].time == 0 || LowPivots[p2].time == 0) continue;
+
+         double val1 = LowPivots[p1].price;
+         double val2 = LowPivots[p2].price;
+         int    pos1 = LowPivots[p1].barIndex;
+         int    pos2 = LowPivots[p2].barIndex;
+
+         if(val1 > val2)
+           {
+            double diff = (val1 - val2) / (double)(pos1 - pos2);
+            double currentLineVal = val2 + diff; 
+            bool valid = true;
+            
+            for(int x = pos2 + 1; x < total; x++)
+              {
+               if(close[x] < currentLineVal)
+                 {
+                  valid = false;
+                  break;
+                 }
+               currentLineVal += diff;
+              }
+
+            if(valid)
+              {
+               string name = ObjPrefix + "Up_" + IntegerToString(countLineLo);
+               CreateTrendLine(name, LowPivots[p2].time, val2, time[total-1], currentLineVal - diff, InpUpColor);
+               countLineLo++;
+               break; 
+              }
+           }
+        }
+     }
+
+   // --- PROCESS DOWNTREND LINES ---
+   for(int p1 = 0; p1 < InpPivotsCheck - 1; p1++)
+     {
+      if(countLineHi >= InpMaxLines) break;
+
+      for(int p2 = p1 + 1; p2 < InpPivotsCheck; p2++)
+        {
+         if(HighPivots[p1].time == 0 || HighPivots[p2].time == 0) continue;
+
+         double val1 = HighPivots[p1].price;
+         double val2 = HighPivots[p2].price;
+         int    pos1 = HighPivots[p1].barIndex;
+         int    pos2 = HighPivots[p2].barIndex;
+
+         if(val1 < val2)
+           {
+            double diff = (val2 - val1) / (double)(pos1 - pos2); 
+            double currentLineVal = val2 - diff;
+            bool valid = true;
+
+            for(int x = pos2 + 1; x < total; x++)
+              {
+               if(close[x] > currentLineVal)
+                 {
+                  valid = false;
+                  break;
+                 }
+               currentLineVal -= diff;
+              }
+
+            if(valid)
+              {
+               string name = ObjPrefix + "Dn_" + IntegerToString(countLineHi);
+               CreateTrendLine(name, HighPivots[p2].time, val2, time[total-1], currentLineVal + diff, InpDnColor);
+               countLineHi++;
+               break;
+              }
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Custom Indicator iteration function                              |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+  {
+   if(rates_total < InpPeriod * 2 + 1)
+      return 0;
+
+   // Time Filter
+   MqlDateTime dt;
+   TimeToStruct(time[rates_total - 1], dt);
+   datetime startTime = StringToTime(IntegerToString(InpStartYear) + "." + IntegerToString(InpStartMonth) + "." + IntegerToString(InpStartDay));
+   if(time[rates_total - 1] < startTime)
+      return(rates_total);
+
+   FindPivots(high, low, time, rates_total);
+   DrawTrendLines(close, time, rates_total);
+
+   return(rates_total);
+  }
+//+------------------------------------------------------------------+
