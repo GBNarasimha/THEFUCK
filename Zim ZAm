@@ -1,0 +1,281 @@
+//+------------------------------------------------------------------+
+//|                                          Liquidity_Sweep_SMC.mq5 |
+//|                                    Copyright 2025, Gemini AI Dev |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Gemini AI Dev"
+#property link      "https://www.mql5.com"
+#property version   "1.20"
+#property strict
+#property indicator_chart_window
+#property indicator_buffers 4
+#property indicator_plots   2
+
+//--- Plot 1: Buy Signal
+#property indicator_label1  "SMC Buy"
+#property indicator_type1   DRAW_ARROW
+#property indicator_color1  clrLime
+#property indicator_style1  STYLE_SOLID
+#property indicator_width1  2
+
+//--- Plot 2: Sell Signal
+#property indicator_label2  "SMC Sell"
+#property indicator_type2   DRAW_ARROW
+#property indicator_color2  clrRed
+#property indicator_style2  STYLE_SOLID
+#property indicator_width2  2
+
+//--- Input Parameters
+input group "Liquidity / Structure"
+input int      InpFractalLeft  = 5;        // Swing Left Bars (Structure Size)
+input int      InpFractalRight = 2;        // Swing Right Bars (Sensitivity)
+input int      InpLookback     = 200;      // Search Range for Liquidity
+
+input group "SMC Filters"
+input bool     InpUseFVG       = true;     // Require FVG/Displacement?
+input bool     InpUseVolume    = true;     // Require Volume Spike?
+input int      InpVolPeriod    = 20;       // Volume MA Period
+input double   InpVolFactor    = 1.1;      // Volume Multiplier (Signal Vol > Avg * Factor)
+
+//--- Global Buffers
+double         BuyBuffer[];
+double         SellBuffer[];
+double         SwingHighBuffer[]; // Internal calculation
+double         SwingLowBuffer[];  // Internal calculation
+
+//+------------------------------------------------------------------+
+//| Custom indicator initialization function                         |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // 1. Map Buffers
+   SetIndexBuffer(0, BuyBuffer, INDICATOR_DATA);
+   SetIndexBuffer(1, SellBuffer, INDICATOR_DATA);
+   SetIndexBuffer(2, SwingHighBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(3, SwingLowBuffer, INDICATOR_CALCULATIONS);
+
+   // 2. Set Arrow Codes
+   PlotIndexSetInteger(0, PLOT_ARROW, 233); // Up Arrow
+   PlotIndexSetInteger(1, PLOT_ARROW, 234); // Down Arrow
+   
+   // 3. Set Empty Values
+   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator deinitialization function                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, "SMC_LiqLine_");
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator iteration function                              |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+   // Ensure we have enough bars for Fractals + Volume MA
+   int minBars = InpFractalLeft + InpFractalRight + InpVolPeriod + 5;
+   if(rates_total < minBars) return(0);
+
+   int start = prev_calculated - 1;
+   if(start < minBars) start = minBars;
+
+   // --- Main Loop ---
+   for(int i = start; i < rates_total; i++)
+   {
+      BuyBuffer[i] = EMPTY_VALUE;
+      SellBuffer[i] = EMPTY_VALUE;
+      
+      // 1. Find the most recent VALID Swing High/Low (Liquidity Pool)
+      double liqHigh = 0.0;
+      double liqLow = 0.0;
+      
+      // Look backwards to find the nearest fractal (Liquidity Pool)
+      // We start looking from i-InpFractalRight to ensure we find a completed fractal
+      for(int k = InpFractalRight + 1; k < InpLookback; k++)
+      {
+         int idx = i - k;
+         if(idx < InpFractalLeft + InpFractalRight) break;
+         
+         if(liqHigh == 0.0 && IsFractalHigh(high, idx)) liqHigh = high[idx];
+         if(liqLow == 0.0 && IsFractalLow(low, idx))   liqLow  = low[idx];
+         
+         if(liqHigh > 0 && liqLow > 0) break;
+      }
+      
+      // Store internal state
+      SwingHighBuffer[i] = liqHigh;
+      SwingLowBuffer[i]  = liqLow;
+
+      // Draw Lines for visual aid (only on latest bar)
+      if(i == rates_total - 1)
+      {
+         DrawLiqLine("SMC_LiqLine_H", time[i], liqHigh, clrRed);
+         DrawLiqLine("SMC_LiqLine_L", time[i], liqLow, clrLime);
+      }
+
+      // --- CURRENT CANDLE DATA ---
+      double cHigh  = high[i];
+      double cLow   = low[i];
+      double cClose = close[i];
+      double cOpen  = open[i];
+      
+      // Previous candle (the sweep candle)
+      double pHigh  = high[i-1];
+      double pLow   = low[i-1];
+      double pClose = close[i-1];
+      double pOpen  = open[i-1];
+
+      // Volume Check (Manual Calculation)
+      bool volConfirmed = true;
+      if(InpUseVolume)
+      {
+         // Calculate SMA of Volume
+         long volSum = 0;
+         for(int k = 0; k < InpVolPeriod; k++)
+         {
+            if(i - 1 - k >= 0) volSum += tick_volume[i - 1 - k];
+         }
+         double averageVol = (double)volSum / (double)InpVolPeriod;
+         
+         // Check if Sweep candle (i-1) OR Current candle (i) has high volume
+         double sweepVol = (double)tick_volume[i-1];
+         double currentVol = (double)tick_volume[i];
+         
+         if(sweepVol < averageVol * InpVolFactor && currentVol < averageVol * InpVolFactor) 
+            volConfirmed = false;
+      }
+
+      // ---------------------------------------------------------
+      // BUY SETUP: 
+      // 1. Sweep: Previous Low (i-1) went BELOW Swing Low.
+      // 2. Rejection: Close of (i-1) went back UP (or current candle is shooting up).
+      // 3. Displacement: Current Candle (i) is STRONG Green.
+      // ---------------------------------------------------------
+      if(liqLow > 0)
+      {
+         bool sweepHappened = (pLow < liqLow);
+         
+         // Rejection: Previous candle closed above the low (didn't crash through)
+         // OR Previous candle closed above the liquidity level itself
+         bool rejection = (pClose > pLow + (pHigh-pLow)*0.3); // Not closing at the very bottom
+
+         if(sweepHappened && rejection)
+         {
+            // Displacement / FVG Logic
+            bool fvgConfirmed = true;
+            if(InpUseFVG)
+            {
+               // 1. Current candle is Bullish
+               bool isBullish = (cClose > cOpen);
+               // 2. Current Close broke the High of the Sweep Candle (BMS on lower timeframe)
+               bool brokeStructure = (cClose > pHigh);
+               // 3. Size Check (Body is significant)
+               bool strongBody = MathAbs(cClose - cOpen) > (cHigh - cLow) * 0.5;
+
+               if(!isBullish || !brokeStructure || !strongBody) fvgConfirmed = false;
+            }
+
+            if(fvgConfirmed && volConfirmed)
+            {
+               // Prevent duplicate signals on the same swing
+               if(BuyBuffer[i-1] == EMPTY_VALUE) 
+                  BuyBuffer[i] = cLow - 10 * _Point;
+            }
+         }
+      }
+
+      // ---------------------------------------------------------
+      // SELL SETUP: 
+      // 1. Sweep: Previous High (i-1) went ABOVE Swing High.
+      // 2. Rejection & Displacement.
+      // ---------------------------------------------------------
+      if(liqHigh > 0)
+      {
+         bool sweepHappened = (pHigh > liqHigh);
+         
+         // Rejection: Not closing at the very top
+         bool rejection = (pClose < pHigh - (pHigh-pLow)*0.3);
+
+         if(sweepHappened && rejection)
+         {
+            // Displacement Logic
+            bool fvgConfirmed = true;
+            if(InpUseFVG)
+            {
+               // 1. Current candle is Bearish
+               bool isBearish = (cClose < cOpen);
+               // 2. Current Close broke the Low of the Sweep Candle
+               bool brokeStructure = (cClose < pLow);
+               // 3. Strong Body
+               bool strongBody = MathAbs(cClose - cOpen) > (cHigh - cLow) * 0.5;
+
+               if(!isBearish || !brokeStructure || !strongBody) fvgConfirmed = false;
+            }
+
+            if(fvgConfirmed && volConfirmed)
+            {
+               if(SellBuffer[i-1] == EMPTY_VALUE)
+                  SellBuffer[i] = cHigh + 10 * _Point;
+            }
+         }
+      }
+   }
+
+   return(rates_total);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Check for Fractal High                                   |
+//+------------------------------------------------------------------+
+bool IsFractalHigh(const double &high[], int index)
+{
+   if(index < InpFractalLeft || index >= ArraySize(high) - InpFractalRight) return false;
+
+   double val = high[index];
+   for(int i = 1; i <= InpFractalLeft; i++) if(high[index - i] > val) return false;
+   for(int i = 1; i <= InpFractalRight; i++) if(high[index + i] >= val) return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Check for Fractal Low                                    |
+//+------------------------------------------------------------------+
+bool IsFractalLow(const double &low[], int index)
+{
+   if(index < InpFractalLeft || index >= ArraySize(low) - InpFractalRight) return false;
+
+   double val = low[index];
+   for(int i = 1; i <= InpFractalLeft; i++) if(low[index - i] < val) return false;
+   for(int i = 1; i <= InpFractalRight; i++) if(low[index + i] <= val) return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Draw Liquidity Line                                      |
+//+------------------------------------------------------------------+
+void DrawLiqLine(string name, datetime time, double price, color col)
+{
+   if(price <= 0) return;
+   
+   ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+//+------------------------------------------------------------------+
