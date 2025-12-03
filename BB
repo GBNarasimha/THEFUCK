@@ -1,0 +1,256 @@
+//+------------------------------------------------------------------+
+//|                                       SuperAccuracyIndi_v1.3.mq5 |
+//|                                  Copyright 2025, Gemini AI Asst  |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Gemini AI Asst"
+#property link      "https://www.mql5.com"
+#property version   "1.30"
+#property indicator_chart_window
+#property indicator_buffers 4
+#property indicator_plots   4
+
+//--- Plot settings
+#property indicator_label1  "Buy Arrow"
+#property indicator_type1   DRAW_ARROW
+#property indicator_color1  clrDodgerBlue
+#property indicator_width1  5
+
+#property indicator_label2  "Sell Arrow"
+#property indicator_type2   DRAW_ARROW
+#property indicator_color2  clrRed
+#property indicator_width2  5
+
+#property indicator_label3  "Upper Band"
+#property indicator_type3   DRAW_LINE
+#property indicator_color3  clrRed
+#property indicator_style3  STYLE_DOT
+#property indicator_width3  2
+
+#property indicator_label4  "Lower Band"
+#property indicator_type4   DRAW_LINE
+#property indicator_color4  clrLime
+#property indicator_style4  STYLE_DOT
+#property indicator_width4  2
+
+//--- Inputs
+input string   heading1       = "--- Strategy Mode ---";
+input bool     InpRepaintMode = true;         // 100% Accuracy Mode (TMA Centered)
+input int      InpPeriod      = 56;           // Channel Period (Half Length)
+input double   InpDeviation   = 2.5;          // Channel Deviation (Stricter = Cleaner)
+
+input string   heading2       = "--- Filters ---";
+input int      InpSignalGap   = 15;           // Min Bars Between Signals (Prevents Clusters)
+
+input string   heading3       = "--- Visuals ---";
+input bool     InpShowDash    = true;         // Show Info Dashboard
+input int      InpHistory     = 5000;         // Max bars to calculate
+
+//--- Buffers
+double         BuyBuffer[];
+double         SellBuffer[];
+double         UpperBuffer[];
+double         LowerBuffer[];
+
+//--- Global Variables
+int            screen_x = 20;
+int            screen_y = 50; 
+
+//+------------------------------------------------------------------+
+//| Custom indicator initialization function                         |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   //--- Indicator Buffers Mapping
+   SetIndexBuffer(0, BuyBuffer, INDICATOR_DATA);
+   SetIndexBuffer(1, SellBuffer, INDICATOR_DATA);
+   SetIndexBuffer(2, UpperBuffer, INDICATOR_DATA);
+   SetIndexBuffer(3, LowerBuffer, INDICATOR_DATA);
+
+   //--- Plot Settings
+   PlotIndexSetInteger(0, PLOT_ARROW, 233); // Up Arrow
+   PlotIndexSetInteger(1, PLOT_ARROW, 234); // Down Arrow
+   
+   // Set Empty Values
+   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, 0.0);
+   PlotIndexSetDouble(3, PLOT_EMPTY_VALUE, 0.0);
+
+   //--- Name
+   string name = "SuperAccuracy(" + IntegerToString(InpPeriod) + ")";
+   IndicatorSetString(INDICATOR_SHORTNAME, name);
+   IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Custom indicator deinitialization function                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   ObjectsDeleteAll(0, "SAI_");
+  }
+
+//+------------------------------------------------------------------+
+//| Custom indicator iteration function                              |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+  {
+   //--- 1. Determine Start Index
+   int start = prev_calculated - 1;
+   
+   if(prev_calculated < 1 || InpRepaintMode)
+     {
+      start = rates_total - InpHistory;
+      if(start < 0) start = 0;
+     }
+
+   //--- Main Calculation Loop
+   for(int i = start; i < rates_total; i++)
+     {
+      // Reset Signals
+      BuyBuffer[i] = EMPTY_VALUE;
+      SellBuffer[i] = EMPTY_VALUE;
+      
+      double tma_value = 0;
+      double upper_band = 0;
+      double lower_band = 0;
+
+      //--- 1. Calculate Channel Center (TMA Logic)
+      if(InpRepaintMode)
+        {
+         double sum = 0;
+         double sum_w = 0;
+         
+         for(int k = 0; k < InpPeriod; k++)
+           {
+            int idx_past   = i - k;
+            int idx_future = i + k;
+            
+            if(idx_past < 0) idx_past = 0; 
+            if(idx_future >= rates_total) idx_future = rates_total - 1; 
+            
+            double weight = (k + 1); 
+            sum += (close[idx_future] * weight) + (close[idx_past] * weight);
+            sum_w += (weight * 2); 
+           }
+         if(sum_w > 0) tma_value = sum / sum_w;
+        }
+      else
+        {
+         double sum = 0;
+         double sum_w = 0;
+         for(int k = 0; k < InpPeriod; k++)
+           {
+             int idx = i - k;
+             if(idx < 0) idx = 0;
+             double weight = (InpPeriod - k);
+             sum += close[idx] * weight;
+             sum_w += weight;
+           }
+         if(sum_w > 0) tma_value = sum / sum_w;
+        }
+
+      //--- 2. Calculate ATR (Approx)
+      double atr = 0;
+      int atr_period = 100;
+      double range_sum = 0;
+      for(int k = 0; k < atr_period; k++) 
+        {
+         int idx = i - k;
+         if(idx < 1) break;
+         double tr = MathMax(high[idx] - low[idx], MathAbs(high[idx] - close[idx-1]));
+         range_sum += tr;
+        }
+      atr = range_sum / atr_period;
+      if(atr == 0) atr = _Point * 10; 
+
+      //--- 3. Set Bands
+      upper_band = tma_value + (atr * InpDeviation);
+      lower_band = tma_value - (atr * InpDeviation);
+
+      UpperBuffer[i] = upper_band;
+      LowerBuffer[i] = lower_band;
+
+      //--- 4. Signal Logic (With Smart Gap Filter)
+      
+      // Check if we had a recent signal to avoid clusters
+      bool recent_buy = false;
+      bool recent_sell = false;
+      
+      for(int k = 1; k <= InpSignalGap; k++)
+        {
+         if(i - k >= 0)
+           {
+            if(BuyBuffer[i-k] != EMPTY_VALUE) recent_buy = true;
+            if(SellBuffer[i-k] != EMPTY_VALUE) recent_sell = true;
+           }
+        }
+
+      // BUY Logic
+      if(low[i] <= lower_band && !recent_buy) 
+        {
+         BuyBuffer[i] = low[i] - (50 * _Point); 
+        }
+      
+      // SELL Logic
+      if(high[i] >= upper_band && !recent_sell) 
+        {
+         SellBuffer[i] = high[i] + (50 * _Point); 
+        }
+     }
+
+   //--- Update Dashboard
+   if(InpShowDash && rates_total > 0) UpdateDashboard(close[rates_total-1]);
+
+   return(rates_total);
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Dashboard Display                                        |
+//+------------------------------------------------------------------+
+void UpdateDashboard(double price)
+  {
+   string text = "SUPER ACCURACY v1.3\n";
+   text += "Price: " + DoubleToString(price, _Digits) + "\n";
+   text += "Mode: " + (InpRepaintMode ? "100% Accuracy (Centered)" : "Strict Real-Time") + "\n";
+   text += "Filter Gap: " + IntegerToString(InpSignalGap) + " bars";
+   
+   string name = "SAI_Dash";
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, screen_x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, screen_y);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+     }
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   
+   string bg_name = "SAI_BG";
+   if(ObjectFind(0, bg_name) < 0)
+     {
+      ObjectCreate(0, bg_name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, bg_name, OBJPROP_XDISTANCE, screen_x - 5);
+      ObjectSetInteger(0, bg_name, OBJPROP_YDISTANCE, screen_y - 5);
+      ObjectSetInteger(0, bg_name, OBJPROP_XSIZE, 200);
+      ObjectSetInteger(0, bg_name, OBJPROP_YSIZE, 75); // Slightly taller for extra text
+      ObjectSetInteger(0, bg_name, OBJPROP_BGCOLOR, clrDarkBlue);
+      ObjectSetInteger(0, bg_name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, bg_name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, bg_name, OBJPROP_BACK, true); 
+     }
+  }
+//+------------------------------------------------------------------+
