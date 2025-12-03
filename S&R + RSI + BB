@@ -1,0 +1,400 @@
+//+------------------------------------------------------------------+
+//|                                     ScalpingStrategyIndi.mq5     |
+//|                                   Copyright 2025, Gemini AI      |
+//|                                         https://www.mql5.com     |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Gemini AI"
+#property version   "2.00"
+#property indicator_chart_window
+#property indicator_buffers 2
+#property indicator_plots   2
+
+//--- Plot settings
+#property indicator_label1  "Buy Scalp"
+#property indicator_type1   DRAW_ARROW
+#property indicator_color1  clrLime
+#property indicator_width1  4
+
+#property indicator_label2  "Sell Scalp"
+#property indicator_type2   DRAW_ARROW
+#property indicator_color2  clrRed
+#property indicator_width2  4
+
+//--- INPUTS ---
+input group             "Scalping Oscillators"
+input int               InpRSI_Period     = 5;           // RSI Period (Scalping=5)
+input double            InpRSI_Upper      = 80;          // RSI Overbought
+input double            InpRSI_Lower      = 20;          // RSI Oversold
+input int               InpStoch_K        = 5;           // Stochastic %K
+input int               InpStoch_D        = 3;           // Stochastic %D
+input int               InpStoch_S        = 3;           // Stochastic Slowing
+
+input group             "Trend Filters"
+input int               InpEMA_Fast       = 5;           // Fast EMA
+input int               InpEMA_Slow       = 20;          // Slow EMA
+input int               InpEMA_Trend      = 200;         // Baseline Trend EMA
+
+input group             "Support & Resistance (S/R)"
+input bool              InpFilterSR       = true;        // Filter Signals by S/R Zones?
+input int               InpSRPivotPrd     = 40;          // S/R Pivot Period
+input int               InpSRChannelW     = 20;          // S/R Channel Width %
+input int               InpSRMaxLines     = 10;           // Max S/R Lines
+
+input group             "Price Action"
+input bool              InpUse3BarRev     = true;        // Detect 3-Bar Reversal
+input bool              InpUseEngulfing   = true;        // Detect Engulfing
+input bool              InpUseHammer      = true;        // Detect Hammer/Pinbar
+input bool              InpFilterVolume   = true;        // Volume Increase Required?
+
+input group             "Alerts & Visuals"
+input bool              InpShowLabels     = true;        // Show BUY/SELL Text Labels
+input int               InpTextDist       = 100;         // Text Distance (points)
+input bool              InpAlertPopup     = true;        // Alert: Pop-up
+input bool              InpAlertMobile    = false;       // Alert: Mobile Notification
+input bool              InpAlertSound     = false;       // Alert: Sound
+
+//--- BUFFERS
+double         BuyBuffer[];
+double         SellBuffer[];
+
+//--- S/R STRUCTURES
+struct SRZone {
+   double top;
+   double bottom;
+   double mid;
+   int strength;
+};
+
+//--- GLOBALS
+int            handle_rsi;
+int            handle_stoch;
+int            handle_ema_fast;
+int            handle_ema_slow;
+int            handle_ema_trend;
+
+double         rsi_buf[];
+double         stoch_buf[];
+double         ema_f_buf[];
+double         ema_s_buf[];
+double         ema_t_buf[];
+
+double         g_pivot_vals[]; 
+SRZone         g_final_zones[];
+datetime       g_last_calc_time = 0;
+datetime       g_last_alert_time = 0;
+
+//+------------------------------------------------------------------+
+//| Custom indicator initialization function                         |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   // Map Buffers
+   SetIndexBuffer(0, BuyBuffer, INDICATOR_DATA);
+   SetIndexBuffer(1, SellBuffer, INDICATOR_DATA);
+
+   // Set Arrow Codes
+   PlotIndexSetInteger(0, PLOT_ARROW, 233); // Up Arrow
+   PlotIndexSetInteger(1, PLOT_ARROW, 234); // Down Arrow
+   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+
+   // Indicators
+   handle_rsi = iRSI(NULL, 0, InpRSI_Period, PRICE_CLOSE);
+   handle_stoch = iStochastic(NULL, 0, InpStoch_K, InpStoch_D, InpStoch_S, MODE_SMA, STO_LOWHIGH);
+   handle_ema_fast = iMA(NULL, 0, InpEMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+   handle_ema_slow = iMA(NULL, 0, InpEMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+   handle_ema_trend = iMA(NULL, 0, InpEMA_Trend, 0, MODE_EMA, PRICE_CLOSE);
+   
+   if(handle_rsi == INVALID_HANDLE || handle_stoch == INVALID_HANDLE || 
+      handle_ema_fast == INVALID_HANDLE || handle_ema_slow == INVALID_HANDLE || handle_ema_trend == INVALID_HANDLE)
+     {
+      Print("Failed to create indicator handles");
+      return(INIT_FAILED);
+     }
+
+   IndicatorSetString(INDICATOR_SHORTNAME, "Scalping Strategy Pro");
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Custom indicator deinitialization function                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   IndicatorRelease(handle_rsi);
+   IndicatorRelease(handle_stoch);
+   IndicatorRelease(handle_ema_fast);
+   IndicatorRelease(handle_ema_slow);
+   IndicatorRelease(handle_ema_trend);
+   ObjectsDeleteAll(0, "SCALP_Lbl_");
+   ObjectsDeleteAll(0, "SCALP_Line_");
+  }
+
+//+------------------------------------------------------------------+
+//| Custom indicator iteration function                              |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+  {
+   if(rates_total < 300) return(0);
+
+   int start = prev_calculated - 1;
+   if(start < InpEMA_Trend) start = InpEMA_Trend;
+
+   //--- S/R CALCULATION (Per confirmed bar)
+   datetime current_time = time[rates_total - 1];
+   if(current_time != g_last_calc_time)
+   {
+      CalculateSR(rates_total, high, low, close, open);
+      g_last_calc_time = current_time;
+   }
+
+   //--- COPY BUFFERS
+   if(CopyBuffer(handle_rsi, 0, 0, rates_total, rsi_buf) <= 0) return(0);
+   if(CopyBuffer(handle_stoch, 0, 0, rates_total, stoch_buf) <= 0) return(0);
+   if(CopyBuffer(handle_ema_fast, 0, 0, rates_total, ema_f_buf) <= 0) return(0);
+   if(CopyBuffer(handle_ema_slow, 0, 0, rates_total, ema_s_buf) <= 0) return(0);
+   if(CopyBuffer(handle_ema_trend, 0, 0, rates_total, ema_t_buf) <= 0) return(0);
+
+   //--- MAIN LOOP
+   for(int i = start; i < rates_total; i++)
+     {
+      BuyBuffer[i] = EMPTY_VALUE;
+      SellBuffer[i] = EMPTY_VALUE;
+
+      // Need history
+      if(i < 5) continue;
+
+      // 1. OSCILLATOR CONDITIONS
+      bool rsi_oversold = rsi_buf[i-1] <= InpRSI_Lower || rsi_buf[i] <= InpRSI_Lower;
+      bool rsi_overbought = rsi_buf[i-1] >= InpRSI_Upper || rsi_buf[i] >= InpRSI_Upper;
+      
+      bool rsi_cross_up = rsi_buf[i-1] < 30 && rsi_buf[i] > 30; // Strong buy signal
+      bool rsi_cross_down = rsi_buf[i-1] > 70 && rsi_buf[i] < 70; // Strong sell signal
+
+      // 2. PATTERN RECOGNITION
+      bool pat_buy = false;
+      bool pat_sell = false;
+
+      double body = MathAbs(close[i] - open[i]);
+      double range = high[i] - low[i];
+      double upper_wick = high[i] - MathMax(close[i], open[i]);
+      double lower_wick = MathMin(close[i], open[i]) - low[i];
+
+      // Bullish Engulfing
+      if(InpUseEngulfing && close[i] > open[i] && close[i-1] < open[i-1] && close[i] > high[i-1] && open[i] < low[i-1]) pat_buy = true;
+      // Bearish Engulfing
+      if(InpUseEngulfing && close[i] < open[i] && close[i-1] > open[i-1] && close[i] < low[i-1] && open[i] > high[i-1]) pat_sell = true;
+
+      // Hammer (Bull)
+      if(InpUseHammer && lower_wick > 2 * body && upper_wick < body * 0.5) pat_buy = true;
+      // Shooting Star (Bear)
+      if(InpUseHammer && upper_wick > 2 * body && lower_wick < body * 0.5) pat_sell = true;
+
+      // 3-Bar Reversal (3 down, 1 up)
+      if(InpUse3BarRev)
+      {
+         bool three_down = close[i-3] < open[i-3] && close[i-2] < open[i-2] && close[i-1] < open[i-1];
+         if(three_down && close[i] > open[i]) pat_buy = true;
+
+         bool three_up = close[i-3] > open[i-3] && close[i-2] > open[i-2] && close[i-1] > open[i-1];
+         if(three_up && close[i] < open[i]) pat_sell = true;
+      }
+
+      // 3. VOLUME FILTER
+      if(InpFilterVolume)
+      {
+         if(tick_volume[i] <= tick_volume[i-1]) { pat_buy = false; pat_sell = false; }
+      }
+
+      // 4. S/R ZONE FILTER
+      bool near_support = false;
+      bool near_resistance = false;
+      
+      if(InpFilterSR)
+      {
+         int totalZones = ArraySize(g_final_zones);
+         if(totalZones == 0) continue; // No zones yet
+
+         for(int z=0; z<totalZones; z++)
+         {
+            double zTop = g_final_zones[z].top;
+            double zBot = g_final_zones[z].bottom;
+            double zMid = g_final_zones[z].mid;
+            
+            // Check Support (Price touching/near zone from above)
+            // Wick touched zone OR Close is near top of zone
+            if(low[i] <= zTop && close[i] >= zBot) near_support = true;
+
+            // Check Resistance (Price touching/near zone from below)
+            if(high[i] >= zBot && close[i] <= zTop) near_resistance = true;
+         }
+      }
+      else
+      {
+         near_support = true; // Ignored
+         near_resistance = true; // Ignored
+      }
+
+      // 5. COMBINE SIGNALS
+      // Buy: Oversold context + Pattern + Near Support + (Optional RSI Cross)
+      if(pat_buy && near_support && (rsi_oversold || rsi_cross_up))
+      {
+         BuyBuffer[i] = low[i] - (InpTextDist * _Point);
+         if(InpShowLabels) DrawLabel(time[i], low[i], true);
+         
+         // Trigger Alert only on the LAST closed bar
+         if(i == rates_total - 2 && time[i] != g_last_alert_time)
+         {
+            TriggerAlert("SCALP BUY: " + _Symbol, time[i]);
+            g_last_alert_time = time[i];
+         }
+      }
+
+      // Sell: Overbought context + Pattern + Near Resistance
+      if(pat_sell && near_resistance && (rsi_overbought || rsi_cross_down))
+      {
+         SellBuffer[i] = high[i] + (InpTextDist * _Point);
+         if(InpShowLabels) DrawLabel(time[i], high[i], false);
+
+         if(i == rates_total - 2 && time[i] != g_last_alert_time)
+         {
+            TriggerAlert("SCALP SELL: " + _Symbol, time[i]);
+            g_last_alert_time = time[i];
+         }
+      }
+     }
+   
+   // Draw Lines (Helper)
+   if(InpFilterSR) DrawSRLines();
+   
+   return(rates_total);
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: S/R Calculation Logic                                    |
+//+------------------------------------------------------------------+
+void CalculateSR(int total, const double &high[], const double &low[], const double &close[], const double &open[])
+{
+   ArrayResize(g_pivot_vals, 0);
+   // Simple Pivot Finding
+   int limit = total - InpSRPivotPrd - 2;
+   int start = InpSRPivotPrd + 1;
+   
+   for(int i = limit; i >= start; i--) // Look back
+   {
+      double h = high[i];
+      double l = low[i];
+      bool isPH = true; 
+      bool isPL = true;
+
+      for(int k=1; k<=InpSRPivotPrd; k++) {
+         if(h <= high[i-k] || h < high[i+k]) isPH = false;
+         if(l >= low[i-k] || l > low[i+k]) isPL = false;
+      }
+      
+      if(isPH) AddPivot(h);
+      if(isPL) AddPivot(l);
+      
+      if(ArraySize(g_pivot_vals) >= 100) break; // Limit history
+   }
+   
+   // Create Zones
+   ArrayResize(g_final_zones, 0);
+   int pSize = ArraySize(g_pivot_vals);
+   if(pSize == 0) return;
+   
+   double minP = g_pivot_vals[0], maxP = g_pivot_vals[0];
+   for(int i=0; i<pSize; i++) {
+      if(g_pivot_vals[i] < minP) minP = g_pivot_vals[i];
+      if(g_pivot_vals[i] > maxP) maxP = g_pivot_vals[i];
+   }
+   double cWidth = (maxP - minP) * InpSRChannelW / 1000.0; // Adjusted scale
+
+   for(int i=0; i<pSize; i++) {
+      double base = g_pivot_vals[i];
+      double t = base, b = base;
+      int str = 0;
+      
+      for(int j=0; j<pSize; j++) {
+         if(MathAbs(g_pivot_vals[j] - base) <= cWidth) {
+            t = MathMax(t, g_pivot_vals[j]);
+            b = MathMin(b, g_pivot_vals[j]);
+            str++;
+         }
+      }
+      
+      if(str >= 2) { // Min strength
+         bool exists = false;
+         for(int z=0; z<ArraySize(g_final_zones); z++) {
+             if(MathAbs(g_final_zones[z].mid - (t+b)/2) < cWidth) { exists=true; break; }
+         }
+         if(!exists && ArraySize(g_final_zones) < InpSRMaxLines) {
+            int s = ArraySize(g_final_zones);
+            ArrayResize(g_final_zones, s+1);
+            g_final_zones[s].top = t;
+            g_final_zones[s].bottom = b;
+            g_final_zones[s].mid = (t+b)/2;
+            g_final_zones[s].strength = str;
+         }
+      }
+   }
+}
+
+void AddPivot(double val) {
+   int s = ArraySize(g_pivot_vals);
+   ArrayResize(g_pivot_vals, s+1);
+   g_pivot_vals[s] = val;
+}
+
+void DrawSRLines()
+{
+   int total = ArraySize(g_final_zones);
+   for(int i=0; i<total; i++) {
+      string n = "SCALP_Line_"+IntegerToString(i);
+      if(ObjectFind(0, n) < 0) {
+         ObjectCreate(0, n, OBJ_HLINE, 0, 0, g_final_zones[i].mid);
+         ObjectSetInteger(0, n, OBJPROP_COLOR, clrGray);
+         ObjectSetInteger(0, n, OBJPROP_STYLE, STYLE_DOT);
+      } else {
+         ObjectSetDouble(0, n, OBJPROP_PRICE, g_final_zones[i].mid);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Visuals & Alerts                                                 |
+//+------------------------------------------------------------------+
+void DrawLabel(datetime time, double price, bool isBuy)
+{
+   string name = "SCALP_Lbl_" + TimeToString(time);
+   if(ObjectFind(0, name) >= 0) return;
+
+   double offset = isBuy ? -(InpTextDist * _Point) : (InpTextDist * _Point);
+   string text = isBuy ? "BUY" : "SELL";
+   color clr = isBuy ? clrLime : clrRed;
+   int anchor = isBuy ? ANCHOR_TOP : ANCHOR_BOTTOM;
+
+   ObjectCreate(0, name, OBJ_TEXT, 0, time, price + offset);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, anchor);
+}
+
+void TriggerAlert(string msg, datetime time)
+{
+   if(InpAlertPopup) Alert(msg + " @ " + TimeToString(time));
+   if(InpAlertMobile) SendNotification(msg);
+   if(InpAlertSound) PlaySound("alert.wav");
+}
+//+------------------------------------------------------------------+
