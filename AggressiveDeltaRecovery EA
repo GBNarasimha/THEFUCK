@@ -1,0 +1,313 @@
+//+------------------------------------------------------------------+
+//|                                     AggressiveDeltaRecovery.mq5  |
+//|                                  Copyright 2025, Gemini AI Coder |
+//|                                      https://www.mql5.com        |
+//+------------------------------------------------------------------+
+#property copyright "Gemini AI Coder"
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\SymbolInfo.mqh>
+
+//--- Input Parameters
+input group "Money Management"
+input double   InpBaseLot        = 0.1;      // Base Lot Size
+input double   InpRecoveryMult   = 2.0;      // Aggressive Recovery Multiplier (Martingale)
+input double   InpMaxLot         = 5.0;      // Maximum Allowed Lot Size
+input int      InpStopLoss       = 200;      // Stop Loss (Points)
+input int      InpTakeProfit     = 1000;     // Take Profit (Points)
+input int      InpMagicNum       = 123456;   // Magic Number
+
+input group "Delta & Strategy Settings"
+input int      InpDeltaPeriod    = 14;       // Period to calculate trend/divergence
+input bool     InpUseAbsorption  = true;     // Use Volume Absorption Logic
+input double   InpAbsorbVolMult  = 1.5;      // Volume Multiplier for Absorption (x times avg)
+
+//--- Global Objects
+CTrade         m_trade;
+CPositionInfo  m_position;
+CSymbolInfo    m_symbol;
+
+//--- Global Variables
+datetime       m_prev_bar_time = 0;
+double         m_last_loss_lot = 0.0;
+bool           m_was_last_loss = false;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   m_trade.SetExpertMagicNumber(InpMagicNum);
+   
+   if(!m_symbol.Name(Symbol())) 
+      return(INIT_FAILED);
+      
+   RefreshRates();
+   
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   // Check for New Bar (calculate logic only on bar close)
+   if(!IsNewBar()) return;
+   
+   RefreshRates();
+   
+   // 1. Calculate Delta and Logic
+   double deltaCurrent = CalculateEstimatedDelta(1);
+   double deltaPrev    = CalculateEstimatedDelta(2);
+   
+   bool buySignal = false;
+   bool sellSignal = false;
+   
+   // --- Logic A: Divergence ---
+   // Bullish Divergence: Price Lower Low, Delta Higher Low
+   if(iLow(Symbol(), Period(), 1) < iLow(Symbol(), Period(), 2) && deltaCurrent > deltaPrev)
+     {
+      buySignal = true;
+     }
+   // Bearish Divergence: Price Higher High, Delta Lower High
+   else if(iHigh(Symbol(), Period(), 1) > iHigh(Symbol(), Period(), 2) && deltaCurrent < deltaPrev)
+     {
+      sellSignal = true;
+     }
+     
+   // --- Logic B: Absorption (Optional) ---
+   if(InpUseAbsorption && !buySignal && !sellSignal)
+     {
+      if(IsAbsorption(1, "BUY")) buySignal = true;
+      if(IsAbsorption(1, "SELL")) sellSignal = true;
+     }
+
+   // 2. Execution Logic
+   if(buySignal)
+     {
+      // Aggressive: Close all Sell positions first
+      ClosePositions(POSITION_TYPE_SELL);
+      
+      // If no Buy exists, open one
+      if(CountPositions(POSITION_TYPE_BUY) == 0)
+        {
+         double lot = GetLotSize();
+         double sl = m_symbol.Ask() - InpStopLoss * m_symbol.Point();
+         double tp = m_symbol.Ask() + InpTakeProfit * m_symbol.Point();
+         
+         // Normalize
+         sl = NormalizeDouble(sl, m_symbol.Digits());
+         tp = NormalizeDouble(tp, m_symbol.Digits());
+         
+         m_trade.Buy(lot, Symbol(), m_symbol.Ask(), sl, tp, "Delta Buy");
+        }
+     }
+     
+   if(sellSignal)
+     {
+      // Aggressive: Close all Buy positions first
+      ClosePositions(POSITION_TYPE_BUY);
+      
+      // If no Sell exists, open one
+      if(CountPositions(POSITION_TYPE_SELL) == 0)
+        {
+         double lot = GetLotSize();
+         double sl = m_symbol.Bid() + InpStopLoss * m_symbol.Point();
+         double tp = m_symbol.Bid() - InpTakeProfit * m_symbol.Point();
+         
+         // Normalize
+         sl = NormalizeDouble(sl, m_symbol.Digits());
+         tp = NormalizeDouble(tp, m_symbol.Digits());
+         
+         m_trade.Sell(lot, Symbol(), m_symbol.Bid(), sl, tp, "Delta Sell");
+        }
+     }
+     
+   // Check previous trade result for recovery logic
+   CheckHistory();
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Calculate Estimated Delta based on Candle structure      |
+//+------------------------------------------------------------------+
+double CalculateEstimatedDelta(int shift)
+  {
+   double open  = iOpen(Symbol(), Period(), shift);
+   double close = iClose(Symbol(), Period(), shift);
+   double high  = iHigh(Symbol(), Period(), shift);
+   double low   = iLow(Symbol(), Period(), shift);
+   long   vol   = iVolume(Symbol(), Period(), shift);
+   
+   double totalRange = high - low;
+   if(totalRange == 0) return 0;
+   
+   // Formula: Delta estimation based on where price closed relative to range + Volume weight
+   // If Close > Open, Delta leans positive. 
+   // We use the position of Close within High-Low to weight the volume.
+   
+   double bodySize = close - open;
+   double relativeClose = (close - low) / totalRange; // 0.0 to 1.0
+   
+   // Convert 0.0-1.0 to -1.0 to 1.0 range
+   double direction = (relativeClose - 0.5) * 2.0; 
+   
+   return (double)vol * direction;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Detect Absorption (High Vol, Small Body)                 |
+//+------------------------------------------------------------------+
+bool IsAbsorption(int shift, string type)
+  {
+   long volCurrent = iVolume(Symbol(), Period(), shift);
+   
+   // Calculate Average Volume
+   long volSum = 0;
+   for(int i=1; i<=InpDeltaPeriod; i++) volSum += iVolume(Symbol(), Period(), shift+i);
+   double volAvg = (double)volSum / InpDeltaPeriod;
+   
+   // Check for High Volume
+   if((double)volCurrent < volAvg * InpAbsorbVolMult) return false;
+   
+   double open  = iOpen(Symbol(), Period(), shift);
+   double close = iClose(Symbol(), Period(), shift);
+   double high  = iHigh(Symbol(), Period(), shift);
+   double low   = iLow(Symbol(), Period(), shift);
+   
+   double body = MathAbs(open - close);
+   double range = high - low;
+   
+   // Absorption = Small Body (Doji-like) on High Volume
+   bool isSmallBody = (body < range * 0.3); // Body is less than 30% of range
+   
+   if(!isSmallBody) return false;
+   
+   // Bullish Absorption (Hammer/Pinbar at bottom or Doji stopping bearish move)
+   if(type == "BUY" && (close - low) > (high - close)) return true; // Wicked bottom
+   
+   // Bearish Absorption (Shooting star at top or Doji stopping bullish move)
+   if(type == "SELL" && (high - close) > (close - low)) return true; // Wicked top
+   
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Calculate Lot Size (Aggressive Recovery)                 |
+//+------------------------------------------------------------------+
+double GetLotSize()
+  {
+   double lot = InpBaseLot;
+   
+   if(m_was_last_loss && m_last_loss_lot > 0)
+     {
+      lot = m_last_loss_lot * InpRecoveryMult;
+     }
+   
+   // Cap at Max Lot
+   if(lot > InpMaxLot) lot = InpMaxLot;
+   
+   // Normalize to valid step
+   double step = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
+   lot = MathFloor(lot / step) * step;
+   
+   return lot;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Check History for Last Trade Result                      |
+//+------------------------------------------------------------------+
+void CheckHistory()
+  {
+   HistorySelect(0, TimeCurrent());
+   int total = HistoryDealsTotal();
+   
+   // Find last deal for this symbol & magic number
+   for(int i=total-1; i>=0; i--)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) == InpMagicNum &&
+         HistoryDealGetString(ticket, DEAL_SYMBOL) == Symbol() &&
+         HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT) // Closing deal
+        {
+         double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         double vol    = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+         
+         if(profit < 0)
+           {
+            m_was_last_loss = true;
+            m_last_loss_lot = vol;
+           }
+         else
+           {
+            m_was_last_loss = false;
+            m_last_loss_lot = 0;
+           }
+         return; // Found last deal, exit
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Close Positions by Type                                  |
+//+------------------------------------------------------------------+
+void ClosePositions(ENUM_POSITION_TYPE type)
+  {
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionGetString(POSITION_SYMBOL) == Symbol() &&
+         PositionGetInteger(POSITION_MAGIC) == InpMagicNum)
+        {
+         if(PositionGetInteger(POSITION_TYPE) == type)
+           {
+            m_trade.PositionClose(ticket);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Count Positions                                          |
+//+------------------------------------------------------------------+
+int CountPositions(ENUM_POSITION_TYPE type)
+  {
+   int count = 0;
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionGetString(POSITION_SYMBOL) == Symbol() &&
+         PositionGetInteger(POSITION_MAGIC) == InpMagicNum &&
+         PositionGetInteger(POSITION_TYPE) == type)
+        {
+         count++;
+        }
+     }
+   return count;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Refresh Symbol Data                                      |
+//+------------------------------------------------------------------+
+void RefreshRates()
+  {
+   m_symbol.RefreshRates();
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Is New Bar?                                              |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+  {
+   datetime current_time = iTime(Symbol(), Period(), 0);
+   if(m_prev_bar_time != current_time)
+     {
+      m_prev_bar_time = current_time;
+      return true;
+     }
+   return false;
+  }
