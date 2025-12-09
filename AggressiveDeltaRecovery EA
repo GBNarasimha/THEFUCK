@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                                     AggressiveDeltaRecovery.mq5  |
-//|                                  Copyright 2025, Gemini AI Coder |
-//|                                      https://www.mql5.com        |
+//|                                  AggressiveDeltaRecovery.mq5     |
+//|                          Copyright 2025, Gemini AI Coder         |
+//|                                   https://www.mql5.com           |
 //+------------------------------------------------------------------+
 #property copyright "Gemini AI Coder"
 #property link      "https://www.mql5.com"
-#property version   "1.00"
+#property version   "1.03"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -25,6 +25,23 @@ input group "Delta & Strategy Settings"
 input int      InpDeltaPeriod    = 14;       // Period to calculate trend/divergence
 input bool     InpUseAbsorption  = true;     // Use Volume Absorption Logic
 input double   InpAbsorbVolMult  = 1.5;      // Volume Multiplier for Absorption (x times avg)
+
+input group "Session Settings"
+input bool     InpTradeAsia      = true;     // Trade Asia Session
+input string   InpAsiaStart      = "00:00";  // Asia Start Time (Server Time)
+input string   InpAsiaEnd        = "08:00";  // Asia End Time
+input bool     InpTradeLondon    = true;     // Trade London Session
+input string   InpLondonStart    = "08:00";  // London Start Time (Server Time)
+input string   InpLondonEnd      = "16:00";  // London End Time
+input bool     InpTradeNewYork   = true;     // Trade New York Session
+input string   InpNYStart        = "13:00";  // NY Start Time (Server Time)
+input string   InpNYEnd          = "22:00";  // NY End Time
+
+input group "News Filter Settings"
+input bool     InpUseNewsFilter  = true;     // Use News Filter
+input bool     InpOnlyHighImpact = true;     // Filter only High Impact Events
+input int      InpNewsBefore     = 30;       // Minutes pause BEFORE news
+input int      InpNewsAfter      = 30;       // Minutes pause AFTER news
 
 //--- Global Objects
 CTrade         m_trade;
@@ -52,6 +69,128 @@ int OnInit()
   }
 
 //+------------------------------------------------------------------+
+//| Helper: Check if Current Time is in an Active Session            |
+//+------------------------------------------------------------------+
+bool IsSessionActive(bool enabled, string startStr, string endStr)
+  {
+   if(!enabled) return false;
+
+   // Get Server Time
+   datetime currentTime = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(currentTime, dt);
+   
+   // Convert Current Time to Minutes from start of day (0 - 1439)
+   int currentMinutes = (dt.hour * 60) + dt.min;
+
+   // Parse Start String
+   string startArr[];
+   StringSplit(startStr, ':', startArr);
+   int startMinutes = -1;
+   if(ArraySize(startArr) >= 2) startMinutes = (int)StringToInteger(startArr[0]) * 60 + (int)StringToInteger(startArr[1]);
+
+   // Parse End String
+   string endArr[];
+   StringSplit(endStr, ':', endArr);
+   int endMinutes = -1;
+   if(ArraySize(endArr) >= 2) endMinutes = (int)StringToInteger(endArr[0]) * 60 + (int)StringToInteger(endArr[1]);
+
+   if(startMinutes == -1 || endMinutes == -1) return false; // Error parsing
+
+   // Check Time
+   if(startMinutes < endMinutes)
+     {
+      // Standard Session (e.g., 08:00 to 16:00)
+      if(currentMinutes >= startMinutes && currentMinutes < endMinutes) return true;
+     }
+   else
+     {
+      // Crossover Midnight Session (e.g., 22:00 to 02:00)
+      if(currentMinutes >= startMinutes || currentMinutes < endMinutes) return true;
+     }
+
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Check for High Impact News                               |
+//+------------------------------------------------------------------+
+bool IsNewsTime()
+  {
+   if(!InpUseNewsFilter) return false;
+
+   datetime now = TimeCurrent();
+   
+   // Define the time window to search for events.
+   // We search from (Now - After) to (Now + Before).
+   // If any event falls in this window, we are currently in the restricted period.
+   datetime startSearch = now - (InpNewsAfter * 60);
+   datetime endSearch   = now + (InpNewsBefore * 60);
+   
+   MqlCalendarValue values[];
+   
+   // Fetch calendar values in the window
+   if(CalendarValueHistory(values, startSearch, endSearch))
+     {
+      // Get Chart Currencies (e.g., EUR and USD)
+      string baseCurrency  = SymbolInfoString(Symbol(), SYMBOL_CURRENCY_BASE);
+      string profitCurrency = SymbolInfoString(Symbol(), SYMBOL_CURRENCY_PROFIT);
+      
+      for(int i=0; i<ArraySize(values); i++)
+        {
+         MqlCalendarEvent event;
+         MqlCalendarCountry country;
+         
+         // Get Event Details by ID
+         if(CalendarEventById(values[i].event_id, event))
+           {
+            // Get Country Details by ID (to get the Currency)
+            if(!CalendarCountryById(event.country_id, country)) continue;
+
+            // 1. Check Currency match using country.currency
+            if(country.currency != baseCurrency && country.currency != profitCurrency && country.currency != "USD")
+               continue;
+            
+            // 2. Check Importance
+            if(InpOnlyHighImpact)
+              {
+               if(event.importance != CALENDAR_IMPORTANCE_HIGH) continue;
+              }
+            else
+              {
+               // If filtering all, we accept Moderate and High usually, ignoring Low
+               if(event.importance == CALENDAR_IMPORTANCE_LOW) continue;
+              }
+            
+            // If we are here, we found a relevant event in the "danger zone"
+            Print("News Filter: Pausing trading due to event: ", event.name, " [", country.currency, "]");
+            return true;
+           }
+        }
+     }
+     
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper: Master Time Check                                        |
+//+------------------------------------------------------------------+
+bool IsTradingAllowed()
+  {
+   // 1. News Filter (Priority - Blocks all sessions if true)
+   if(IsNewsTime()) return false;
+  
+   // 2. Session Logic
+   // If any of the enabled sessions are active, return true
+   if(IsSessionActive(InpTradeAsia, InpAsiaStart, InpAsiaEnd)) return true;
+   if(IsSessionActive(InpTradeLondon, InpLondonStart, InpLondonEnd)) return true;
+   if(IsSessionActive(InpTradeNewYork, InpNYStart, InpNYEnd)) return true;
+   
+   // No sessions active
+   return false;
+  }
+
+//+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
@@ -61,6 +200,10 @@ void OnTick()
    
    RefreshRates();
    
+   // --- SESSION & NEWS FILTER CHECK ---
+   // We only look for NEW entries if the session is active and no news is nearby.
+   bool isTimeOK = IsTradingAllowed();
+   
    // 1. Calculate Delta and Logic
    double deltaCurrent = CalculateEstimatedDelta(1);
    double deltaPrev    = CalculateEstimatedDelta(2);
@@ -68,23 +211,27 @@ void OnTick()
    bool buySignal = false;
    bool sellSignal = false;
    
-   // --- Logic A: Divergence ---
-   // Bullish Divergence: Price Lower Low, Delta Higher Low
-   if(iLow(Symbol(), Period(), 1) < iLow(Symbol(), Period(), 2) && deltaCurrent > deltaPrev)
+   // Only calculate signals if time allows trading
+   if(isTimeOK)
      {
-      buySignal = true;
-     }
-   // Bearish Divergence: Price Higher High, Delta Lower High
-   else if(iHigh(Symbol(), Period(), 1) > iHigh(Symbol(), Period(), 2) && deltaCurrent < deltaPrev)
-     {
-      sellSignal = true;
-     }
-     
-   // --- Logic B: Absorption (Optional) ---
-   if(InpUseAbsorption && !buySignal && !sellSignal)
-     {
-      if(IsAbsorption(1, "BUY")) buySignal = true;
-      if(IsAbsorption(1, "SELL")) sellSignal = true;
+      // --- Logic A: Divergence ---
+      // Bullish Divergence: Price Lower Low, Delta Higher Low
+      if(iLow(Symbol(), Period(), 1) < iLow(Symbol(), Period(), 2) && deltaCurrent > deltaPrev)
+        {
+         buySignal = true;
+        }
+      // Bearish Divergence: Price Higher High, Delta Lower High
+      else if(iHigh(Symbol(), Period(), 1) > iHigh(Symbol(), Period(), 2) && deltaCurrent < deltaPrev)
+        {
+         sellSignal = true;
+        }
+         
+      // --- Logic B: Absorption (Optional) ---
+      if(InpUseAbsorption && !buySignal && !sellSignal)
+        {
+         if(IsAbsorption(1, "BUY")) buySignal = true;
+         if(IsAbsorption(1, "SELL")) sellSignal = true;
+        }
      }
 
    // 2. Execution Logic
@@ -107,7 +254,7 @@ void OnTick()
          m_trade.Buy(lot, Symbol(), m_symbol.Ask(), sl, tp, "Delta Buy");
         }
      }
-     
+      
    if(sellSignal)
      {
       // Aggressive: Close all Buy positions first
@@ -127,7 +274,7 @@ void OnTick()
          m_trade.Sell(lot, Symbol(), m_symbol.Bid(), sl, tp, "Delta Sell");
         }
      }
-     
+      
    // Check previous trade result for recovery logic
    CheckHistory();
   }
