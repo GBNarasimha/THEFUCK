@@ -1,13 +1,13 @@
 //+------------------------------------------------------------------+
-//|                                     Order Blocks with Volume.mq5 |
-//|                             Copyright 2025, Quantum Conversion   |
+//|                                              OrderBlocksEA.mq5   |
+//|                             , Narasi Conversion   |
 //+------------------------------------------------------------------+
 #property copyright "QuantumTradingSystems"
-#property version   "1.02"
-#property description "Order Blocks with Volume Analysis (Ultra Low Lag)"
-#property indicator_chart_window
-#property indicator_buffers 0
-#property indicator_plots   0
+#property version   "1.01"
+#property description "Order Blocks with Volume EA - Auto Close & Reverse Logic"
+
+//--- INCLUDES
+#include <Trade\Trade.mqh>
 
 //--- ENUMS
 enum ENUM_VOL_METHOD {
@@ -17,47 +17,58 @@ enum ENUM_VOL_METHOD {
 };
 
 //--- INPUTS
+input group "Trading Settings"
+input double   InpLotSize        = 0.1;         // Fixed Lot Size
+input double   InpRiskReward     = 2.0;         // Risk:Reward Ratio (e.g. 1:2)
+input int      InpMagicNum       = 123456;      // Magic Number
+input int      InpSlippage       = 3;           // Max Slippage (points)
+
 input group "Order Blocks"
 input int      InpLookback       = 3;           // Consolidation Lookback
 input double   InpThreshold      = 0.5;         // Breakout Threshold %
-input int      InpMaxBlocks      = 10;          // Maximum Order Blocks
-input int      InpMaxHistory     = 2000;        // Max History Bars (Prevents Lag)
+input int      InpMaxBlocks      = 10;          // Max Visual Blocks to Keep
 
 input group "Volume"
 input ENUM_VOL_METHOD InpVolMethod = VOL_RELATIVE; // Volume Calculation Method
 input int      InpVolLookback    = 20;          // Volume Lookback Period
 input double   InpVolThreshold   = 1.2;         // Volume Threshold Multiplier
 
-//--- COLORS
+//--- COLORS (Visuals)
 color BullColor = C'11,133,30';  // #0b851e
 color BearColor = C'242,54,69';  // #f23645
 
 //--- STRUCTURES
 struct OrderBlock {
-   string   name;       // Unique object name
-   double   top;        // Top Price
-   double   bottom;     // Bottom Price
-   bool     isBull;     // Type
-   datetime time;       // Creation Time
-   bool     active;     // Is active?
+   string   name;
+   double   top;
+   double   bottom;
+   bool     isBull;
+   datetime time;
+   bool     active;
 };
 
 //--- GLOBALS
-OrderBlock bullBlocks[];
-OrderBlock bearBlocks[];
+CTrade         trade;
+OrderBlock     bullBlocks[];
+OrderBlock     bearBlocks[];
+datetime       lastBarTime = 0;
 
 //+------------------------------------------------------------------+
-//| Custom indicator initialization function                         |
+//| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Clean up any existing objects from this indicator to start fresh
+   trade.SetExpertMagicNumber(InpMagicNum);
+   trade.SetDeviationInPoints(InpSlippage);
+   
+   // Clean up old visual objects
    ObjectsDeleteAll(0, "OBVol_");
+   
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Custom indicator deinitialization function                       |
+//| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
@@ -65,85 +76,149 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| Custom indicator iteration function                              |
+//| Expert tick function                                             |
 //+------------------------------------------------------------------+
-int OnCalculate(const int rates_total,
-                const int prev_calculated,
-                const datetime &time[],
-                const double &open[],
-                const double &high[],
-                const double &low[],
-                const double &close[],
-                const long &tick_volume[],
-                const long &volume[],
-                const int &spread[])
+void OnTick()
 {
-   // Safety check for not enough data
-   if(rates_total < InpVolLookback + 5) return(0);
+   // --- 1. NEW BAR CHECK ---
+   datetime currentTime = iTime(_Symbol, _Period, 0);
+   if(currentTime == lastBarTime) return; // Still on same bar
+   lastBarTime = currentTime;
 
-   // Arrays as series for easier indexing matching Pine Script logic
-   ArraySetAsSeries(time, true);
-   ArraySetAsSeries(open, true);
+   // --- 2. DATA PREPARATION ---
+   int dataNeeded = InpVolLookback + 10;
+   
+   double high[], low[], close[], open[];
+   long   tick_volume[];
+   datetime time[];
+
+   if(CopyHigh(_Symbol, _Period, 0, dataNeeded, high) < dataNeeded) return;
+   if(CopyLow(_Symbol, _Period, 0, dataNeeded, low) < dataNeeded) return;
+   if(CopyClose(_Symbol, _Period, 0, dataNeeded, close) < dataNeeded) return;
+   if(CopyOpen(_Symbol, _Period, 0, dataNeeded, open) < dataNeeded) return;
+   if(CopyTickVolume(_Symbol, _Period, 0, dataNeeded, tick_volume) < dataNeeded) return;
+   if(CopyTime(_Symbol, _Period, 0, dataNeeded, time) < dataNeeded) return;
+
    ArraySetAsSeries(high, true);
    ArraySetAsSeries(low, true);
    ArraySetAsSeries(close, true);
+   ArraySetAsSeries(open, true);
    ArraySetAsSeries(tick_volume, true);
+   ArraySetAsSeries(time, true);
 
-   // --- OPTIMIZED LIMIT CALCULATION (ZERO LAG) ---
-   int limit;
+   // --- 3. CALCULATE LOGIC ON LAST CLOSED BAR (Index 1) ---
+   int i = 1; 
 
-   if(prev_calculated == 0)
+   // Maintenance
+   CheckMitigation(low[i], high[i]);
+
+   // Signal Logic
+   bool is_consol = IsConsolidation(i, InpLookback, high, low);
+   bool bull_break, bear_break;
+   IsBreakout(i, close, high, low, open, bull_break, bear_break);
+   double vol_strength = GetVolumeStrength(i, tick_volume, InpVolLookback);
+
+   // --- 4. TRADING EXECUTION (REVERSAL LOGIC) ---
+   if(is_consol && vol_strength >= InpVolThreshold)
    {
-      // FIRST RUN: Only go back InpMaxHistory bars. 
-      // Do NOT process the whole chart (could be 100k bars).
-      limit = InpMaxHistory; 
-      
-      // Ensure we don't go out of bounds
-      if(limit > rates_total - (InpVolLookback + 5))
-         limit = rates_total - (InpVolLookback + 5);
-   }
-   else
-   {
-      // LIVE UPDATE: Calculate delta
-      limit = rates_total - prev_calculated;
-      
-      // Add small buffer to ensure we catch the just-closed bar
-      if(limit < 1) limit = 1; 
-   }
-
-   // --- MAIN LOOP ---
-   // Loop stops at i >= 1 (Closed bars only).
-   // We skip index 0 to prevent flickering and heavy recalculation on live ticks.
-   
-   for(int i = limit; i >= 1; i--)
-   {
-      // 1. Check Mitigation (Delete invalid blocks based on price action)
-      CheckMitigation(i, low[i], high[i]);
-      
-      // 2. Calculate Logic
-      bool is_consol = IsConsolidation(i, InpLookback, high, low);
-      bool bull_break, bear_break;
-      IsBreakout(i, close, high, low, open, bull_break, bear_break);
-      
-      // Calculate Volume
-      double vol_strength = GetVolumeStrength(i, tick_volume, InpVolLookback);
-
-      // 3. Create New Order Blocks
-      if(is_consol && vol_strength >= InpVolThreshold)
+      // --- BULLISH SIGNAL ---
+      if(bull_break)
       {
-         if(bull_break)
+         // A. Close any existing Sell positions (Reversal)
+         ClosePositions(POSITION_TYPE_SELL);
+         
+         // B. Only Buy if we don't already have a Buy (Once Buy)
+         if(!HasOpenPosition(POSITION_TYPE_BUY))
          {
-            CreateBlock(true, i, time, high, low, vol_strength);
+             CreateBlock(true, i, time, high, low, vol_strength); // Draw
+             
+             double sl = low[i+1]; 
+             double entry = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+             double risk = entry - sl;
+             
+             if(risk > 0)
+             {
+                 double tp = entry + (risk * InpRiskReward);
+                 sl = NormalizeDouble(sl, _Digits);
+                 tp = NormalizeDouble(tp, _Digits);
+                 
+                 if(trade.Buy(InpLotSize, _Symbol, entry, sl, tp, "OB Bull Reversal"))
+                 {
+                     Print("Bullish Reversal: Sells closed, Buy opened.");
+                 }
+             }
          }
-         if(bear_break)
+      }
+      
+      // --- BEARISH SIGNAL ---
+      if(bear_break)
+      {
+         // A. Close any existing Buy positions (Reversal)
+         ClosePositions(POSITION_TYPE_BUY);
+         
+         // B. Only Sell if we don't already have a Sell (Once Sell)
+         if(!HasOpenPosition(POSITION_TYPE_SELL))
          {
-            CreateBlock(false, i, time, high, low, vol_strength);
+             CreateBlock(false, i, time, high, low, vol_strength); // Draw
+             
+             double sl = high[i+1];
+             double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+             double risk = sl - entry;
+             
+             if(risk > 0)
+             {
+                 double tp = entry - (risk * InpRiskReward);
+                 sl = NormalizeDouble(sl, _Digits);
+                 tp = NormalizeDouble(tp, _Digits);
+                 
+                 if(trade.Sell(InpLotSize, _Symbol, entry, sl, tp, "OB Bear Reversal"))
+                 {
+                     Print("Bearish Reversal: Buys closed, Sell opened.");
+                 }
+             }
          }
       }
    }
+}
 
-   // Return rates_total to save state for next tick
-   return(rates_total);
+//+------------------------------------------------------------------+
+//| HELPER: Close specific position types                            |
+//+------------------------------------------------------------------+
+void ClosePositions(ENUM_POSITION_TYPE type)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == InpMagicNum && PositionGetSymbol(ticket) == _Symbol)
+         {
+            if(PositionGetInteger(POSITION_TYPE) == type)
+            {
+               trade.PositionClose(ticket);
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| HELPER: Check if position exists                                 |
+//+------------------------------------------------------------------+
+bool HasOpenPosition(ENUM_POSITION_TYPE type)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == InpMagicNum && PositionGetSymbol(ticket) == _Symbol)
+         {
+            if(PositionGetInteger(POSITION_TYPE) == type) return true;
+         }
+      }
+   }
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -151,23 +226,17 @@ int OnCalculate(const int rates_total,
 //+------------------------------------------------------------------+
 double GetVolumeStrength(int i, const long &vol[], int len)
 {
-   if(InpVolMethod == VOL_SIMPLE)
-   {
-      return (double)vol[i]; 
-   }
+   if(InpVolMethod == VOL_SIMPLE) return (double)vol[i]; 
    else if(InpVolMethod == VOL_RELATIVE)
    {
       double sum = 0;
       for(int k=0; k<len; k++) sum += (double)vol[i+k];
       double avg = sum / len;
-      if(avg == 0) return 0.0;
-      return (double)vol[i] / avg;
+      return (avg == 0) ? 0.0 : (double)vol[i] / avg;
    }
    else // Weighted
    {
-      double w1 = 2.0;
-      double w2 = 1.0;
-      return ((double)vol[i] * w1 + (double)vol[i+1] * w2) / (w1 + w2);
+      return ((double)vol[i] * 2.0 + (double)vol[i+1] * 1.0) / 3.0;
    }
 }
 
@@ -176,30 +245,20 @@ double GetVolumeStrength(int i, const long &vol[], int len)
 //+------------------------------------------------------------------+
 bool IsConsolidation(int i, int len, const double &high[], const double &low[])
 {
-   double max_h = -DBL_MAX;
-   double min_h = DBL_MAX;
-   double max_l = -DBL_MAX;
-   double min_l = DBL_MAX;
+   double max_h = -DBL_MAX, min_h = DBL_MAX, max_l = -DBL_MAX, min_l = DBL_MAX;
 
-   // Find range over lookback
    for(int k=0; k<len; k++)
    {
       if(high[i+k] > max_h) max_h = high[i+k];
       if(high[i+k] < min_h) min_h = high[i+k];
-      
       if(low[i+k] > max_l) max_l = low[i+k];
       if(low[i+k] < min_l) min_l = low[i+k];
    }
    
-   double high_range = max_h - min_h;
-   double low_range = max_l - min_l;
-   double avg_range = (high_range + low_range) / 2.0;
-   
-   double current_range = high[i+1] - low[i+1];
-   
+   double avg_range = ((max_h - min_h) + (max_l - min_l)) / 2.0;
    if(avg_range == 0) return false;
    
-   return (current_range <= avg_range * (1.0 + InpThreshold));
+   return ((high[i+1] - low[i+1]) <= avg_range * (1.0 + InpThreshold));
 }
 
 //+------------------------------------------------------------------+
@@ -212,7 +271,7 @@ void IsBreakout(int i, const double &close[], const double &high[], const double
 }
 
 //+------------------------------------------------------------------+
-//| OBJECT: Create Block (OPTIMIZED FOR PERFORMANCE)                 |
+//| OBJECT: Create Block                                             |
 //+------------------------------------------------------------------+
 void CreateBlock(bool isBull, int i, const datetime &time[], const double &high[], const double &low[], double vol)
 {
@@ -220,28 +279,16 @@ void CreateBlock(bool isBull, int i, const datetime &time[], const double &high[
    string name_rect = name_base + "_Rect";
    string name_text = name_base + "_Txt";
    
-   // --- Logic to manage Max Blocks (FIFO) ---
-   if(isBull) 
-   {
-      ManageArraySize(bullBlocks);
-   }
-   else 
-   {
-      ManageArraySize(bearBlocks);
-   }
+   if(isBull) ManageArraySize(bullBlocks);
+   else       ManageArraySize(bearBlocks);
    
    datetime t1 = time[i+1];
    double p_top = high[i+1];
    double p_bot = low[i+1];
    
-   // --- CRITICAL OPTIMIZATION ---
-   // Only set Object properties IF the object was just created.
-   // Repeatedly calling ObjectSetInteger on existing objects causes massive lag.
-   
    if(ObjectCreate(0, name_rect, OBJ_RECTANGLE, 0, t1, p_top, time[i], p_bot))
    {
       color c = isBull ? BullColor : BearColor;
-      // These calls are EXPENSIVE. Only do them once per object.
       ObjectSetInteger(0, name_rect, OBJPROP_COLOR, c);
       ObjectSetInteger(0, name_rect, OBJPROP_FILL, true);
       ObjectSetInteger(0, name_rect, OBJPROP_BACK, true); 
@@ -258,7 +305,6 @@ void CreateBlock(bool isBull, int i, const datetime &time[], const double &high[
       ObjectSetInteger(0, name_text, OBJPROP_ANCHOR, isBull ? ANCHOR_LEFT_UPPER : ANCHOR_LEFT_LOWER);
    }
 
-   // Add to Array
    OrderBlock newBlock;
    newBlock.name = name_base;
    newBlock.top = p_top;
@@ -280,36 +326,26 @@ void CreateBlock(bool isBull, int i, const datetime &time[], const double &high[
 }
 
 //+------------------------------------------------------------------+
-//| LOGIC: Mitigation and Cleanup                                    |
+//| LOGIC: Visual Maintenance                                        |
 //+------------------------------------------------------------------+
-void CheckMitigation(int i, double currentLow, double currentHigh)
+void CheckMitigation(double currentLow, double currentHigh)
 {
-   // Check Bull Blocks
    for(int k = ArraySize(bullBlocks) - 1; k >= 0; k--)
    {
-      if(bullBlocks[k].active)
+      if(bullBlocks[k].active && currentLow <= bullBlocks[k].bottom)
       {
-         // If price closes/wicks below the block
-         if(currentLow <= bullBlocks[k].bottom)
-         {
-            ObjectDelete(0, bullBlocks[k].name + "_Rect");
-            ObjectDelete(0, bullBlocks[k].name + "_Txt");
-            ArrayRemove(bullBlocks, k, 1);
-         }
+         ObjectDelete(0, bullBlocks[k].name + "_Rect");
+         ObjectDelete(0, bullBlocks[k].name + "_Txt");
+         ArrayRemove(bullBlocks, k, 1);
       }
    }
-   
-   // Check Bear Blocks
    for(int k = ArraySize(bearBlocks) - 1; k >= 0; k--)
    {
-      if(bearBlocks[k].active)
+      if(bearBlocks[k].active && currentHigh >= bearBlocks[k].top)
       {
-         if(currentHigh >= bearBlocks[k].top)
-         {
-            ObjectDelete(0, bearBlocks[k].name + "_Rect");
-            ObjectDelete(0, bearBlocks[k].name + "_Txt");
-            ArrayRemove(bearBlocks, k, 1);
-         }
+         ObjectDelete(0, bearBlocks[k].name + "_Rect");
+         ObjectDelete(0, bearBlocks[k].name + "_Txt");
+         ArrayRemove(bearBlocks, k, 1);
       }
    }
 }
@@ -318,7 +354,6 @@ void ManageArraySize(OrderBlock &arr[])
 {
    if(ArraySize(arr) >= InpMaxBlocks)
    {
-      // Delete oldest (FIFO)
       ObjectDelete(0, arr[0].name + "_Rect");
       ObjectDelete(0, arr[0].name + "_Txt");
       ArrayRemove(arr, 0, 1);
