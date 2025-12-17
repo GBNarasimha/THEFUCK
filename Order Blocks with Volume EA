@@ -24,7 +24,7 @@ input int      InpMagicNum       = 123456;      // Magic Number
 input int      InpSlippage       = 3;           // Max Slippage (points)
 
 input group "Order Blocks"
-input int      InpLookback       = 1;           // Consolidation Lookback
+input int      InpLookback       = 2;           // Consolidation Lookback
 input double   InpThreshold      = 0.5;         // Breakout Threshold %
 input int      InpMaxBlocks      = 10;          // Max Visual Blocks to Keep
 
